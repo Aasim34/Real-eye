@@ -351,32 +351,20 @@ async function analyzeContentAction(fileDataUri) {
   const payload = {
     contents: chatHistory,
     generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: "OBJECT",
-        properties: {
-          "isAI": { "type": "BOOLEAN" },
-          "confidence": { "type": "NUMBER" },
-          "overallJustification": { "type": "STRING" },
-          "visualAnalysis": {
-            "type": "OBJECT",
-            "properties": { "verdict": { "type": "STRING" }, "explanation": { "type": "STRING" } }
-          },
-          "noiseAnalysis": {
-            "type": "OBJECT",
-            "properties": { "verdict": { "type": "STRING" }, "explanation": { "type": "STRING" } }
-          },
-          "fingerprintAnalysis": {
-            "type": "OBJECT",
-            "properties": { "verdict": { "type": "STRING" }, "explanation": { "type": "STRING" } }
-          },
-        },
-      },
+      temperature: 0.2,
     },
   };
   
-  const apiKey = "AIzaSyBdhdKKC71y5bg-6zTvOidPHSrf7vMZnl8";
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+  // Generative key: used for generateContent calls (text + multimodal/vision)
+  const generativeApiKey = import.meta.env.VITE_GEMINI_API_KEY_Generative;
+  // Vision key: reserved for vision-only API endpoints
+  // const visionApiKey = import.meta.env.VITE_GEMINI_API_KEY_Vision;
+
+  if (!generativeApiKey) {
+    throw new Error("Missing VITE_GEMINI_API_KEY_Generative. Set it in .env and restart the dev server.");
+  }
+  const model = import.meta.env.VITE_GEMINI_MODEL || "gemini-3-flash-preview";
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${generativeApiKey}`;
 
   const fetchWithBackoff = async (attempt = 1) => {
       try {
@@ -387,12 +375,33 @@ async function analyzeContentAction(fileDataUri) {
           });
 
           if (!response.ok) {
-              if (response.status === 429 && attempt < 5) {
-                  const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+              let errorDetail = "";
+              let retryAfterMs = null;
+              try {
+                  const errorBody = await response.json();
+                  if (errorBody && errorBody.error && errorBody.error.message) {
+                      errorDetail = ` - ${errorBody.error.message}`;
+                      // Parse "Please retry in Xs" from the error message
+                      const retryMatch = errorBody.error.message.match(/retry in ([\d.]+)s/i);
+                      if (retryMatch) {
+                          retryAfterMs = Math.ceil(parseFloat(retryMatch[1])) * 1000 + 1000;
+                      }
+                  }
+              } catch {
+                  // Ignore JSON parse errors to keep fallback message clean
+              }
+              // Also check the Retry-After header
+              const retryAfterHeader = response.headers.get('Retry-After');
+              if (retryAfterHeader && !retryAfterMs) {
+                  retryAfterMs = (parseInt(retryAfterHeader, 10) + 1) * 1000;
+              }
+              if (response.status === 429 && attempt < 4) {
+                  const delay = retryAfterMs ?? (Math.pow(2, attempt + 2) * 1000 + Math.random() * 2000);
+                  console.warn(`Rate limited. Retrying in ${Math.round(delay / 1000)}s (attempt ${attempt}/3)...`);
                   await new Promise(res => setTimeout(res, delay));
                   return fetchWithBackoff(attempt + 1);
               }
-              throw new Error(`API call failed with status: ${response.status}`);
+              throw new Error(`API call failed with status: ${response.status}${errorDetail}`);
           }
           return await response.json();
       } catch (error) {
@@ -405,7 +414,9 @@ async function analyzeContentAction(fileDataUri) {
   if (result.candidates && result.candidates.length > 0 &&
       result.candidates[0].content && result.candidates[0].content.parts &&
       result.candidates[0].content.parts.length > 0) {
-    const json = result.candidates[0].content.parts[0].text;
+    let json = result.candidates[0].content.parts[0].text;
+    // Strip markdown code fences (```json ... ``` or ``` ... ```) that Gemini often adds
+    json = json.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?\s*```\s*$/i, '').trim();
     const parsedJson = JSON.parse(json);
     return parsedJson;
   } else {
